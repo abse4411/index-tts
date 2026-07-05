@@ -24,7 +24,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
-parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
+parser.add_argument("--model_dir", type=str, default="D:\mydir\models\IndexTTS-2", help="Model checkpoints directory")
 parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
 parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
 parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
@@ -1216,6 +1216,138 @@ with gr.Blocks(
 
 
 
+# ---------------------------------------------------------------------------
+# FastAPI REST API for programmatic TTS access (shares the loaded IndexTTS2 model)
+# ---------------------------------------------------------------------------
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+import uvicorn
+import tempfile
+import shutil
+import json as _json
+import asyncio
+
+rest_app = FastAPI(title="IndexTTS REST API")
+
+
+@rest_app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+@rest_app.post("/api/tts")
+async def tts_api(
+    text: str = Form(...),
+    prompt_audio: UploadFile = File(...),
+    emo_audio: Optional[UploadFile] = File(None),
+    emo_control_method: int = Form(0),
+    emo_weight: float = Form(0.65),
+    emo_vector: str = Form("[0,0,0,0,0,0,0,0]"),
+    emo_text: str = Form(""),
+    emo_random: bool = Form(False),
+    max_text_tokens_per_segment: int = Form(120),
+    do_sample: bool = Form(True),
+    top_p: float = Form(0.8),
+    top_k: int = Form(30),
+    temperature: float = Form(0.8),
+    length_penalty: float = Form(0.0),
+    num_beams: int = Form(3),
+    repetition_penalty: float = Form(10.0),
+    max_mel_tokens: int = Form(1500),
+):
+    """Generate speech audio via IndexTTS2.
+
+    Mirrors the ``gen_single`` gradio handler: saves uploaded audio to temp
+    files, applies emotion-control logic, then calls ``tts.infer()``.
+    Returns the generated WAV as a file download.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="indextts_api_")
+    try:
+        # --- save uploaded audio files ---
+        prompt_path = os.path.join(tmpdir, "prompt.wav")
+        with open(prompt_path, "wb") as f:
+            shutil.copyfileobj(prompt_audio.file, f)
+
+        emo_ref_path = None
+        if emo_audio is not None and emo_audio.filename:
+            emo_ref_path = os.path.join(tmpdir, "emo_ref.wav")
+            with open(emo_ref_path, "wb") as f:
+                shutil.copyfileobj(emo_audio.file, f)
+
+        # --- parse emotion vector ---
+        try:
+            vec_input = _json.loads(emo_vector)
+            if not isinstance(vec_input, list) or len(vec_input) < 8:
+                vec_input = [0.0] * 8
+        except Exception:
+            vec_input = [0.0] * 8
+
+        # --- apply emotion control logic (same as gen_single) ---
+        if emo_control_method == 0:          # same as speaker
+            emo_ref_path = None
+            vec = None
+        elif emo_control_method == 1:        # emotion reference audio
+            vec = None
+        elif emo_control_method == 2:        # emotion vectors
+            vec = tts.normalize_emo_vec(vec_input, apply_bias=True)
+        else:                                 # mode 3: emotion text description
+            vec = None
+
+        if emo_text == "":
+            emo_text = None
+
+        kwargs = {
+            "do_sample": bool(do_sample),
+            "top_p": float(top_p),
+            "top_k": int(top_k) if int(top_k) > 0 else None,
+            "temperature": float(temperature),
+            "length_penalty": float(length_penalty),
+            "num_beams": int(num_beams),
+            "repetition_penalty": float(repetition_penalty),
+            "max_mel_tokens": int(max_mel_tokens),
+        }
+
+        os.makedirs("outputs", exist_ok=True)
+        output_path = os.path.join("outputs", f"api_{int(time.time() * 1000)}.wav")
+
+        def _do_infer():
+            with mutex:
+                tts.gr_progress = None
+                return tts.infer(
+                    spk_audio_prompt=prompt_path,
+                    text=text,
+                    output_path=output_path,
+                    emo_audio_prompt=emo_ref_path,
+                    emo_alpha=float(emo_weight),
+                    emo_vector=vec,
+                    use_emo_text=(emo_control_method == 3),
+                    emo_text=emo_text,
+                    use_random=bool(emo_random),
+                    verbose=cmd_args.verbose,
+                    max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+                    **kwargs,
+                )
+
+        result = await asyncio.to_thread(_do_infer)
+
+        if result and os.path.exists(str(result)):
+            return FileResponse(
+                str(result),
+                media_type="audio/wav",
+                filename=os.path.basename(str(result)),
+            )
+        else:
+            return JSONResponse(
+                {"error": "TTS generation returned no output"}, status_code=500
+            )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     demo.queue(20)
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
+    rest_app = gr.mount_gradio_app(rest_app, demo, path="/")
+    uvicorn.run(rest_app, host=cmd_args.host, port=cmd_args.port)
