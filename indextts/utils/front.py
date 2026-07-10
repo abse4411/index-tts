@@ -3,7 +3,7 @@ from functools import lru_cache
 import os
 import traceback
 import re
-from typing import List, Union, overload
+from typing import List, Union, overload, Tuple
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
 from sentencepiece import SentencePieceProcessor
@@ -602,6 +602,44 @@ class TextTokenizer:
         return TextTokenizer.split_segments_by_token(
             tokenized, self.punctuation_marks_tokens, max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
         )
+
+    def tokenize_and_split(self, text: str, max_text_tokens_per_segment=120, quick_streaming_tokens=0, return_text=False) -> Union[List[List[str]], List[Tuple[List[str], str]]]:
+        """Tokenize text and split into segments.
+
+        Newlines are treated as hard split points: the text is first split by
+        one or more newline characters (``\\r`` / ``\\n``), then each piece is
+        tokenized and further split by punctuation and length using
+        :meth:`split_segments_by_token`.
+
+        Consecutive newlines are collapsed into a single split point so that no
+        empty segments are produced.
+
+        When ``return_text`` is ``True``, each segment is returned as a
+        ``(tokens, text)`` tuple where ``text`` is the decoded (readable) form
+        of that segment, computed once here instead of forcing every caller to
+        decode the BPE tokens themselves.
+        """
+        # Split by one or more newlines; strip each piece and drop any that are
+        # empty or contain only whitespace (spaces, tabs, etc.) so that no blank
+        # segments are ever produced.
+        text_pieces = [p.strip() for p in re.split(r'[\r\n]+', text) if p.strip()]
+        if not text_pieces:
+            # Entire text is empty or whitespace-only; fall back to original text
+            text_pieces = [text]
+        all_segments: List[List[str]] = []
+        for piece in text_pieces:
+            tokens = self.tokenize(piece)
+            if not tokens:
+                continue
+            segments = TextTokenizer.split_segments_by_token(
+                tokens, self.punctuation_marks_tokens,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                quick_streaming_tokens=quick_streaming_tokens,
+            )
+            all_segments.extend(segments)
+        if return_text:
+            return [(seg, self.decode(self.convert_tokens_to_ids(seg))) for seg in all_segments]
+        return all_segments
 
 
 if __name__ == "__main__":

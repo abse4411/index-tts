@@ -509,7 +509,7 @@ class IndexTTS2:
 
         self._set_gr_progress(0.1, "text processing...")
         text_tokens_list = self.tokenizer.tokenize(text)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens)
+        segments = self.tokenizer.tokenize_and_split(text, max_text_tokens_per_segment, quick_streaming_tokens=quick_streaming_tokens, return_text=True)
         segments_count = len(segments)
 
         text_token_ids = self.tokenizer.convert_tokens_to_ids(text_tokens_list)
@@ -522,7 +522,7 @@ class IndexTTS2:
             print("text_tokens_list:", text_tokens_list)
             print("segments count:", segments_count)
             print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
-            print(*segments, sep="\n")
+            print(*[seg for seg, _ in segments], sep="\n")
         do_sample = generation_kwargs.pop("do_sample", True)
         top_p = generation_kwargs.pop("top_p", 0.8)
         top_k = generation_kwargs.pop("top_k", 30)
@@ -534,6 +534,15 @@ class IndexTTS2:
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
 
+        # Record per-segment meta info (text + audio sample count) so callers
+        # can build subtitles aligned to the generated audio. Reset on every
+        # inference to avoid leaking data from a previous run.
+        self.last_segments_info = {
+            'segments': [],
+            'sampling_rate': sampling_rate,
+            'interval_silence': interval_silence,
+        }
+
         wavs = []
         gpt_gen_time = 0
         gpt_forward_time = 0
@@ -541,7 +550,7 @@ class IndexTTS2:
         bigvgan_time = 0
         has_warned = False
         silence = None # for stream_return
-        for seg_idx, sent in enumerate(segments):
+        for seg_idx, (sent, seg_text) in enumerate(segments):
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
 
@@ -674,6 +683,9 @@ class IndexTTS2:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
+                # Record this segment's text (decoded once at split time) and its
+                # audio length in samples for downstream subtitle generation.
+                self.last_segments_info['segments'].append((seg_text, int(wav.shape[-1])))
                 if stream_return:
                     yield wav.cpu()
                     if silence == None:

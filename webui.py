@@ -1227,8 +1227,53 @@ import tempfile
 import shutil
 import json as _json
 import asyncio
+import zipfile
 
 rest_app = FastAPI(title="IndexTTS REST API")
+
+
+def _format_srt_time(seconds: float) -> str:
+    """Format seconds into SRT timestamp ``HH:MM:SS,mmm``."""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _build_srt(segments_info: dict) -> str:
+    """Build an SRT subtitle string from per-segment meta info.
+
+    ``segments_info`` has the shape returned by ``IndexTTS2.last_segments_info``::
+        {'segments': [(text, num_samples), ...],
+         'sampling_rate': int, 'interval_silence': int (ms)}
+
+    Each segment's start time is the running cursor; its duration is derived
+    from its sample count and the sampling rate. A silence of ``interval_silence``
+    ms is inserted between consecutive segments (matching the audio that the
+    model actually produced).
+    """
+    segments = segments_info.get('segments', [])
+    sr = segments_info.get('sampling_rate', 22050)
+    sil_dur = segments_info.get('interval_silence', 0) / 1000.0
+
+    lines = []
+    t = 0.0
+    n = len(segments)
+    for idx, (seg_text, num_samples) in enumerate(segments):
+        dur = num_samples / sr
+        start = t
+        end = t + dur
+        # Normalize whitespace/newlines so a single subtitle stays on one line.
+        text_line = " ".join(str(seg_text).split())
+        lines.append(str(idx + 1))
+        lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
+        lines.append(text_line)
+        lines.append("")
+        t = end
+        if idx < n - 1:
+            t += sil_dur
+    return "\n".join(lines)
 
 
 @rest_app.get("/api/health")
@@ -1255,6 +1300,7 @@ async def tts_api(
     num_beams: int = Form(3),
     repetition_penalty: float = Form(10.0),
     max_mel_tokens: int = Form(1500),
+    with_subtitle: bool = Form(False),
 ):
     """Generate speech audio via IndexTTS2.
 
@@ -1314,7 +1360,7 @@ async def tts_api(
         def _do_infer():
             with mutex:
                 tts.gr_progress = None
-                return tts.infer(
+                result = tts.infer(
                     spk_audio_prompt=prompt_path,
                     text=text,
                     output_path=output_path,
@@ -1328,10 +1374,28 @@ async def tts_api(
                     max_text_tokens_per_segment=int(max_text_tokens_per_segment),
                     **kwargs,
                 )
+                # Read per-segment meta info while still holding the mutex so it
+                # cannot be clobbered by a concurrent request.
+                seg_info = getattr(tts, 'last_segments_info', None)
+                return result, seg_info
 
-        result = await asyncio.to_thread(_do_infer)
+        result, seg_info = await asyncio.to_thread(_do_infer)
 
         if result and os.path.exists(str(result)):
+            if with_subtitle and seg_info and seg_info.get('segments'):
+                srt_content = _build_srt(seg_info)
+                srt_path = os.path.splitext(output_path)[0] + ".srt"
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(srt_content)
+                zip_path = os.path.splitext(output_path)[0] + ".zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(output_path, arcname=os.path.basename(output_path))
+                    zf.write(srt_path, arcname=os.path.basename(srt_path))
+                return FileResponse(
+                    zip_path,
+                    media_type="application/zip",
+                    filename=os.path.basename(zip_path),
+                )
             return FileResponse(
                 str(result),
                 media_type="audio/wav",

@@ -546,7 +546,7 @@ class IndexTTS:
         self._set_gr_progress(0.1, "text processing...")
         auto_conditioning = cond_mel
         text_tokens_list = self.tokenizer.tokenize(text)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+        segments = self.tokenizer.tokenize_and_split(text, max_text_tokens_per_segment)
         if verbose:
             print("text token count:", len(text_tokens_list))
             print("segments count:", len(segments))
